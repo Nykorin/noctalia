@@ -1,5 +1,6 @@
 #include "shell/bar/widgets/taskbar_widget.h"
 
+#include "capture/toplevel_thumbnail_capture.h"
 #include "compositors/compositor_detect.h"
 #include "compositors/hyprland/hyprland_window_id.h"
 #include "compositors/workspace_backend.h"
@@ -13,6 +14,7 @@
 #include "shell/dock/pinned_apps.h"
 #include "shell/panel/panel_manager.h"
 #include "shell/tooltip/tooltip_manager.h"
+#include "shell/wayland/foreign_toplevels.h"
 #include "shell/wayland/layer_shell.h"
 #include "shell/wayland/wayland_toplevels.h"
 #include "system/app_identity.h"
@@ -266,6 +268,187 @@ void TaskbarWidget::syncWorkspaceGroupingCapability() {
 }
 
 TaskbarWidget::~TaskbarWidget() { m_aliveGuard.reset(); }
+
+namespace {
+
+  constexpr std::size_t kMaxPreviewWindows = 4;
+  // A hovered preview refreshes this often; older thumbnails are captured again.
+  constexpr auto kPreviewRefreshInterval = std::chrono::milliseconds(2000);
+  constexpr auto kPreviewMaxAge = std::chrono::milliseconds(1500);
+
+} // namespace
+
+std::vector<TaskbarWidget::PreviewWindow>
+TaskbarWidget::previewWindows(const TaskModel& task, const std::vector<TaskRef>& candidates) const {
+  std::vector<PreviewWindow> windows;
+  if (!candidates.empty()) {
+    for (const TaskRef candidate : candidates) {
+      const TaskModel* member = resolveTask(m_tasks, candidate, m_taskGeneration);
+      if (member != nullptr && member->running && windows.size() < kMaxPreviewWindows) {
+        windows.push_back({
+            .appId = member->appId,
+            .title = member->title,
+            .order = member->order,
+            .minimized = member->minimizedCount > 0,
+        });
+      }
+    }
+  } else if (task.pinned && task.instanceCount > 1) {
+    for (const auto& window :
+         m_platform.enrichedWindowsForApp(task.idLower, task.startupWmClassLower, toplevelOutputFilter())) {
+      if (windows.size() < kMaxPreviewWindows) {
+        windows.push_back({
+            .appId = window.appId,
+            .title = window.title,
+            .order = window.order,
+            .minimized = window.minimizeState.has_value() && window.minimizeState->minimized,
+        });
+      }
+    }
+  } else if (task.running) {
+    windows.push_back({
+        .appId = task.appId,
+        .title = task.title,
+        .order = task.order,
+        .minimized = task.minimizedCount > 0,
+    });
+  }
+  return windows;
+}
+
+ext_foreign_toplevel_handle_v1* TaskbarWidget::previewCaptureHandle(const PreviewWindow& window) const {
+  const std::string idLower = StringUtils::toLower(window.appId);
+  const auto candidates = m_platform.foreignToplevels().extWindowsForApp(idLower, idLower);
+  std::vector<const ToplevelInfo*> sameTitle;
+  for (const auto& info : candidates) {
+    if (info.extHandle != nullptr && (window.title.empty() || info.title == window.title)) {
+      sameTitle.push_back(&info);
+    }
+  }
+  if (sameTitle.size() == 1) {
+    return sameTitle.front()->extHandle;
+  }
+  if (sameTitle.empty()) {
+    return candidates.size() == 1 ? candidates.front().extHandle : nullptr;
+  }
+  // Several windows share the title. Both lists number windows in the order they appeared, so the
+  // window's rank among its wlr namesakes picks the ext one, as long as both lists agree on how many.
+  std::size_t wlrCount = 0;
+  std::size_t rank = 0;
+  for (const auto& info : m_platform.windowsForApp(idLower, idLower)) {
+    if (info.title == window.title) {
+      ++wlrCount;
+      rank += info.order < window.order ? 1U : 0U;
+    }
+  }
+  if (wlrCount != sameTitle.size() || rank >= sameTitle.size()) {
+    return nullptr;
+  }
+  std::ranges::sort(sameTitle, [](const ToplevelInfo* a, const ToplevelInfo* b) { return a->order < b->order; });
+  return sameTitle[rank]->extHandle;
+}
+
+std::optional<TooltipContent>
+TaskbarWidget::windowPreviewTooltip(InputArea* area, const TaskModel& task, const std::vector<TaskRef>& candidates) {
+  if (!m_configOptions.windowPreview) {
+    return std::nullopt;
+  }
+  if (m_previewCapture == nullptr) {
+    m_previewCapture = std::make_unique<ToplevelThumbnailCapture>(m_platform.wayland());
+  }
+  if (!m_previewCapture->available()) {
+    return std::nullopt;
+  }
+  const auto windows = previewWindows(task, candidates);
+  if (windows.empty()) {
+    return std::nullopt;
+  }
+  if (m_previewArea != area) {
+    m_previewArea = area;
+    m_previewQueue.clear();
+  }
+
+  std::unordered_set<ext_foreign_toplevel_handle_v1*> live;
+  m_platform.foreignToplevels().visitExtToplevelHandles([&](ext_foreign_toplevel_handle_v1* handle) {
+    live.insert(handle);
+  });
+  std::erase_if(m_previewThumbnails, [&](const auto& item) { return !live.contains(item.first); });
+
+  const auto now = std::chrono::steady_clock::now();
+  TooltipPreview preview;
+  bool anyImage = false;
+  for (const auto& window : windows) {
+    TooltipPreviewItem item{.title = !window.title.empty() ? window.title : displayTitle(task)};
+    if (auto* handle = previewCaptureHandle(window); handle != nullptr) {
+      const auto cached = m_previewThumbnails.find(handle);
+      if (cached != m_previewThumbnails.end()) {
+        item.rgba = cached->second.rgba;
+        item.width = cached->second.width;
+        item.height = cached->second.height;
+        anyImage = true;
+      }
+      const bool stale = cached == m_previewThumbnails.end() || now - cached->second.capturedAt > kPreviewMaxAge;
+      // A minimised window has nothing to capture; keep whatever was captured before.
+      if (stale
+          && !window.minimized
+          && handle != m_previewInFlight
+          && std::ranges::find(m_previewQueue, handle) == m_previewQueue.end()) {
+        m_previewQueue.push_back(handle);
+      }
+    }
+    preview.items.push_back(std::move(item));
+  }
+  captureNextPreview();
+  if (!anyImage) {
+    return std::nullopt;
+  }
+  return TooltipContent{std::move(preview)};
+}
+
+void TaskbarWidget::captureNextPreview() {
+  if (m_previewCapture == nullptr || m_previewCapture->busy()) {
+    return;
+  }
+  if (m_previewArea == nullptr || !m_previewArea->hovered()) {
+    m_previewQueue.clear();
+    return;
+  }
+  while (!m_previewQueue.empty()) {
+    auto* handle = m_previewQueue.front();
+    m_previewQueue.pop_front();
+    bool handleIsLive = false;
+    m_platform.foreignToplevels().visitExtToplevelHandles([&](ext_foreign_toplevel_handle_v1* live) {
+      handleIsLive |= live == handle;
+    });
+    if (!handleIsLive) {
+      continue;
+    }
+    m_previewInFlight = handle;
+    m_previewCapture->capture(
+        handle, static_cast<int>(kTooltipPreviewThumbWidth * 2.0F), static_cast<int>(kTooltipPreviewThumbHeight * 2.0F),
+        [this, alive = std::weak_ptr<void>(m_aliveGuard),
+         handle](std::optional<ScreencopyImage> image, std::string error) {
+          if (alive.expired()) {
+            return;
+          }
+          m_previewInFlight = nullptr;
+          if (error.empty() && image.has_value() && image->width > 0 && image->height > 0) {
+            m_previewThumbnails[handle] = PreviewThumbnail{
+                .rgba = std::make_shared<const std::vector<std::uint8_t>>(std::move(image->rgba)),
+                .width = image->width,
+                .height = image->height,
+                .capturedAt = std::chrono::steady_clock::now(),
+            };
+            if (m_previewArea != nullptr && m_previewArea->hovered()) {
+              m_previewArea->requestTooltipRefresh();
+            }
+          }
+          captureNextPreview();
+        }
+    );
+    return;
+  }
+}
 
 bool TaskbarWidget::taskInWorkspaceGroup(const TaskModel& task, const WorkspaceModel& ws) {
   if (task.workspaceKey.empty()) {
@@ -886,6 +1069,8 @@ void TaskbarWidget::rebuild(Renderer& renderer) {
   }
   m_taskTiles.clear();
   m_taskTiles.reserve(m_tasks.size());
+  m_previewArea = nullptr;
+  m_previewQueue.clear();
   // The strip's children are about to be destroyed; drop the gesture and its visuals so nothing
   // outlives the nodes they point at.
   m_drag = {};
@@ -1379,10 +1564,14 @@ void TaskbarWidget::buildTaskButtons(Renderer& renderer) {
     }
     // Installed even for a currently empty title: a title arriving later must surface without a
     // rebuild. Empty content measures to nothing, so the popup never shows.
-    area->setTooltipProvider([this, taskRef, tooltipCandidates] -> TooltipContent {
+    InputArea* const areaPtr = area.get();
+    auto tooltipProvider = [this, taskRef, tooltipCandidates, areaPtr] -> TooltipContent {
       const TaskModel* current = resolveTask(m_tasks, taskRef, m_taskGeneration);
       if (current == nullptr) {
         return TooltipContent{std::monostate{}};
+      }
+      if (auto preview = windowPreviewTooltip(areaPtr, *current, tooltipCandidates); preview.has_value()) {
+        return std::move(*preview);
       }
       std::size_t minimized = current->minimizedCount;
       if (!tooltipCandidates.empty()) {
@@ -1397,7 +1586,11 @@ void TaskbarWidget::buildTaskButtons(Renderer& renderer) {
       const std::size_t count = tooltipCandidates.empty() ? current->instanceCount : tooltipCandidates.size();
       const std::string text = taskTooltip(*current, minimized, count);
       return !text.empty() ? TooltipContent{text} : TooltipContent{std::monostate{}};
-    });
+    };
+    area->setTooltipProvider(
+        std::move(tooltipProvider),
+        m_configOptions.windowPreview ? kPreviewRefreshInterval : std::chrono::milliseconds{}
+    );
     m_taskTiles.push_back({
         .taskIndex = taskRef.index,
         .area = area.get(),
