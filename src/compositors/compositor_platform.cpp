@@ -24,6 +24,7 @@
 #include "compositors/umbriel/umbriel_output_backend.h"
 #include "compositors/umbriel/umbriel_runtime.h"
 #include "compositors/umbriel/umbriel_workspace_backend.h"
+#include "compositors/wayfire/wayfire_workspace_backend.h"
 #include "compositors/wayland_workspaces.h"
 #include "compositors/workspace_alert_service.h"
 #include "core/log.h"
@@ -421,10 +422,15 @@ namespace {
     case compositors::CompositorKind::Mango:
     case compositors::CompositorKind::Dwl:
     case compositors::CompositorKind::Kde:
-    case compositors::CompositorKind::Unknown:
       break;
     case compositors::CompositorKind::Labwc:
       return std::make_unique<LabwcWorkspaceBackend>();
+    case compositors::CompositorKind::Unknown:
+      // Noctalia doesn't recognise Wayfire; its IPC socket, which the backend reads from, identifies it.
+      if (const char* socket = std::getenv("WAYFIRE_SOCKET"); socket != nullptr && socket[0] != '\0') {
+        return std::make_unique<WayfireWorkspaceBackend>();
+      }
+      break;
     }
     return nullptr;
   }
@@ -621,6 +627,28 @@ CompositorPlatform::CompositorPlatform(WaylandConnection& wayland)
     labwcBackend->setProviders(
         [this] -> std::vector<Workspace> {
           return m_workspaces != nullptr ? m_workspaces->all() : std::vector<Workspace>{};
+        },
+        [this](const std::function<void(const WlrToplevelSnapshot&)>& visit) { m_toplevels.visitWlrToplevels(visit); }
+    );
+  }
+  if (auto* wayfireBackend = dynamic_cast<WayfireWorkspaceBackend*>(m_workspaceMetadataBackend.get());
+      wayfireBackend != nullptr) {
+    // Wayfire's workspaces come from ext-workspace, which has no per-window membership; the
+    // backend places windows from Wayfire's IPC and joins them to these wlr toplevels.
+    wayfireBackend->setProviders(
+        [this](const std::string& outputName) -> std::vector<Workspace> {
+          if (m_workspaces == nullptr) {
+            return {};
+          }
+          if (outputName.empty()) {
+            return m_workspaces->all();
+          }
+          for (const auto& output : outputs()) {
+            if (output.connectorName == outputName) {
+              return m_workspaces->forOutput(output.output);
+            }
+          }
+          return {};
         },
         [this](const std::function<void(const WlrToplevelSnapshot&)>& visit) { m_toplevels.visitWlrToplevels(visit); }
     );
