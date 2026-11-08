@@ -2,6 +2,7 @@
 
 #include "compositors/compositor_platform.h"
 #include "core/timer_manager.h"
+#include "render/scene/tooltip_content.h"
 #include "shell/bar/widget.h"
 #include "system/desktop_entry.h"
 #include "system/icon_resolver.h"
@@ -9,7 +10,9 @@
 #include "ui/palette.h"
 #include "ui/signal.h"
 
+#include <chrono>
 #include <cstdint>
+#include <deque>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -25,6 +28,8 @@ class Flex;
 class InputArea;
 class Label;
 class TaskbarWidgetTestAccess;
+class ToplevelThumbnailCapture;
+struct ext_foreign_toplevel_handle_v1;
 struct wl_output;
 struct wl_surface;
 struct zwlr_foreign_toplevel_handle_v1;
@@ -68,6 +73,7 @@ struct TaskbarWidgetOptions {
   float inactiveOpacity = 1.0F;
   float iconScale = 1.0F;
   bool preferSymbolicIcons = false;
+  bool windowPreview = false;
   bool colorizeIcons = false;
   int itemSpacing = 4;
   std::vector<std::string> pinned;
@@ -212,6 +218,28 @@ private:
   void doLayout(Renderer& renderer, float containerWidth, float containerHeight) override;
   void doUpdate(Renderer& renderer) override;
 
+  struct PreviewWindow {
+    std::string appId;
+    std::string title;
+    // Opening order in the wlr list; breaks ties between windows with the same title.
+    std::uint64_t order = 0;
+    bool minimized = false;
+  };
+
+  struct PreviewThumbnail {
+    std::shared_ptr<const std::vector<std::uint8_t>> rgba;
+    int width = 0;
+    int height = 0;
+    std::chrono::steady_clock::time_point capturedAt;
+  };
+
+  std::vector<PreviewWindow> previewWindows(const TaskModel& task, const std::vector<TaskRef>& candidates) const;
+  ext_foreign_toplevel_handle_v1* previewCaptureHandle(const PreviewWindow& window) const;
+  // Thumbnails of the tile's windows once at least one has been captured; nullopt keeps the text tooltip.
+  std::optional<TooltipContent>
+  windowPreviewTooltip(InputArea* area, const TaskModel& task, const std::vector<TaskRef>& candidates);
+  void captureNextPreview();
+
   void rebuild(Renderer& renderer);
   void clearChildren(Flex* flex) const;
   void buildTaskButtons(Renderer& renderer);
@@ -334,6 +362,13 @@ private:
   std::vector<TaskTile> m_taskTiles;
   // Last rectangle sent per window, so layout passes only send changes.
   std::unordered_map<zwlr_foreign_toplevel_handle_v1*, ToplevelRectangle> m_sentRectangles;
+  // Window previews (window_preview): one capture at a time, for the hovered tile only.
+  std::unique_ptr<ToplevelThumbnailCapture> m_previewCapture;
+  std::unordered_map<ext_foreign_toplevel_handle_v1*, PreviewThumbnail> m_previewThumbnails;
+  std::deque<ext_foreign_toplevel_handle_v1*> m_previewQueue;
+  ext_foreign_toplevel_handle_v1* m_previewInFlight = nullptr;
+  // Tile whose tooltip shows the previews; cleared before task-strip children are destroyed.
+  InputArea* m_previewArea = nullptr;
   std::vector<WorkspaceModel> m_workspaces;
   // Full workspace list before "hide empty" filtering; used for scroll navigation.
   std::vector<WorkspaceModel> m_allWorkspaces;

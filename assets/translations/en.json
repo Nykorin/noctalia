@@ -5242,6 +5242,10 @@
           "description": "Widget width in pixels",
           "label": "Width"
         },
+        "window-preview": {
+          "description": "Show thumbnails of an app's windows when hovering its icon, where the compositor supports window capture",
+          "label": "Window Previews"
+        },
         "window-title-max-width": {
           "description": "Maximum width in pixels for window titles",
           "label": "Window Title Max Width"

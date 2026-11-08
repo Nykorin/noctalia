@@ -4,12 +4,14 @@
 #include "core/deferred_call.h"
 #include "core/log.h"
 #include "core/ui_phase.h"
+#include "render/core/texture_manager.h"
 #include "render/render_context.h"
 #include "render/render_target.h"
 #include "render/scene/input_area.h"
 #include "render/scene/node.h"
 #include "shell/wayland/layer_shell.h"
 #include "ui/builders.h"
+#include "ui/controls/image.h"
 #include "ui/palette.h"
 #include "ui/style.h"
 #include "wayland/popup_surface.h"
@@ -36,6 +38,27 @@ namespace {
   // Monospace so grid-mode value columns don't reflow on tiny per-tick content changes
   // (e.g. rising bitrate). Resolved via fontconfig — respects the user's `monospace` alias.
   constexpr std::string_view kValueFontFamily = "monospace";
+  constexpr float kPreviewGap = Style::spaceSm;
+  constexpr float kPreviewCaptionGap = Style::spaceXs;
+
+  struct PreviewMetrics {
+    float thumbW = 0.0F;
+    float thumbH = 0.0F;
+    float gap = 0.0F;
+    float captionGap = 0.0F;
+    float captionH = 0.0F;
+  };
+
+  PreviewMetrics previewMetrics(Renderer& renderer, float scale, float fontSize) {
+    const auto caption = renderer.measureText("Ag", fontSize);
+    return {
+        .thumbW = std::round(kTooltipPreviewThumbWidth * scale),
+        .thumbH = std::round(kTooltipPreviewThumbHeight * scale),
+        .gap = kPreviewGap * scale,
+        .captionGap = kPreviewCaptionGap * scale,
+        .captionH = std::ceil(caption.bottom - caption.top),
+    };
+  }
 
   std::unique_ptr<Label> makeTooltipTextLabel(std::string_view text, float fontSize, float maxWidth) {
     return ui::label({
@@ -653,6 +676,19 @@ TooltipManager::Size TooltipManager::measureContent(Renderer& renderer, const To
     return {std::max(w, 1U), std::max(h, 1U)};
   }
 
+  if (const auto* preview = std::get_if<TooltipPreview>(&content)) {
+    if (preview->items.empty()) {
+      return {};
+    }
+    const PreviewMetrics m = previewMetrics(renderer, scale, fontSize);
+    const auto count = static_cast<float>(preview->items.size());
+    const float contentW = count * m.thumbW + (count - 1.0F) * m.gap;
+    const float contentH = m.thumbH + m.captionGap + m.captionH;
+    auto w = static_cast<std::uint32_t>(std::ceil(contentW + padV * 2.0F + kBorder * 2.0F));
+    auto h = static_cast<std::uint32_t>(std::ceil(contentH + padV * 2.0F + kBorder * 2.0F));
+    return {std::max(w, 1U), std::max(h, 1U)};
+  }
+
   if (const auto* rows = std::get_if<std::vector<TooltipRow>>(&content)) {
     if (rows->empty()) {
       return {};
@@ -713,6 +749,53 @@ void TooltipManager::buildScene(const TooltipContent& content, float w, float h,
     label->measure(renderer);
     label->setPosition(padH + kBorder, padV + kBorder);
     m_sceneRoot->addChild(std::move(label));
+    return;
+  }
+
+  if (const auto* preview = std::get_if<TooltipPreview>(&content)) {
+    const PreviewMetrics m = previewMetrics(renderer, scale, fontSize);
+    float x = padV + kBorder;
+    const float y = padV + kBorder;
+    for (const auto& item : preview->items) {
+      bool loaded = false;
+      if (item.rgba != nullptr
+          && item.width > 0
+          && item.height > 0
+          && item.rgba->size() >= static_cast<std::size_t>(item.width) * static_cast<std::size_t>(item.height) * 4U) {
+        auto image = ui::image({.fit = ImageFit::Contain, .radius = Style::scaledRadiusSm()});
+        image->setSize(m.thumbW, m.thumbH);
+        loaded = image->setSourceRaw(
+            renderer, item.rgba->data(), item.rgba->size(), item.width, item.height, item.width * 4, PixmapFormat::RGBA,
+            true
+        );
+        if (loaded) {
+          image->setPosition(x, y);
+          m_sceneRoot->addChild(std::move(image));
+        }
+      }
+      if (!loaded) {
+        auto placeholder = ui::box({
+            .fill = colorSpecFromRole(ColorRole::SurfaceContainerHigh),
+            .radius = Style::scaledRadiusSm(),
+            .width = m.thumbW,
+            .height = m.thumbH,
+        });
+        placeholder->setPosition(x, y);
+        m_sceneRoot->addChild(std::move(placeholder));
+      }
+      auto caption = ui::label({
+          .text = item.title,
+          .fontSize = fontSize,
+          .color = colorSpecFromRole(ColorRole::OnSurface),
+          .maxWidth = m.thumbW,
+          .maxLines = 1,
+          .ellipsize = TextEllipsize::End,
+      });
+      caption->measure(renderer);
+      caption->setPosition(x + std::round((m.thumbW - caption->width()) * 0.5F), y + m.thumbH + m.captionGap);
+      m_sceneRoot->addChild(std::move(caption));
+      x += m.thumbW + m.gap;
+    }
     return;
   }
 
