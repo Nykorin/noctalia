@@ -1,5 +1,8 @@
 # Noctalia
 
+> [!NOTE]
+> This is the `wayfire` branch of an **unofficial fork**, not Noctalia itself. It adds Wayfire integration that upstream has declined. See [WAYFIRE.md](WAYFIRE.md) for what it changes and how to install it, and report problems [on this fork](https://github.com/Nykorin/noctalia/issues), not to Noctalia.
+
 Noctalia is a native Wayland desktop shell for people who want a polished, configurable Linux desktop without stitching together a separate bar, launcher, notification daemon, lock screen, wallpaper tool, and settings UI.
 
 It provides the shell layer around your compositor: bars, widgets, dock, launcher, control center, notifications, wallpaper, lock screen, session actions, clipboard history, OSDs, tray integration, and desktop widgets. The project is built directly on Wayland and OpenGL ES with no Qt or GTK dependency, so the UI, rendering, configuration, and IPC model are designed as one cohesive shell instead of a collection of unrelated panels and scripts.
