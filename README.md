@@ -1,7 +1,7 @@
 # Noctalia
 
 > [!NOTE]
-> This is the `wayfire` branch of an **unofficial fork**, not Noctalia itself. It adds Wayfire integration that upstream has declined. See [WAYFIRE.md](WAYFIRE.md) for what it changes and how to install it, and report problems [on this fork](https://github.com/Nykorin/noctalia/issues), not to Noctalia.
+> This is the `wayfire-extras` branch of an **unofficial fork**, not Noctalia itself. It adds Wayfire integration that upstream has declined, and two taskbar features that need extra Wayfire plugins. See [WAYFIRE.md](WAYFIRE.md) for what it changes and how to install it, and report problems [on this fork](https://github.com/Nykorin/noctalia/issues), not to Noctalia.
 
 Noctalia is a native Wayland desktop shell for people who want a polished, configurable Linux desktop without stitching together a separate bar, launcher, notification daemon, lock screen, wallpaper tool, and settings UI.
 
